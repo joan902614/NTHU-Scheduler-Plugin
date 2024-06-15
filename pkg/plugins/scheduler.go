@@ -2,12 +2,16 @@ package plugins
 
 import (
 	"context"
-	"log"
+	"encoding/json"
 	"fmt"
+	"log"
+	"math"
+	"strconv"
+
 	v1 "k8s.io/api/core/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/kubernetes/pkg/scheduler/framework"
-	"encoding/json"
 )
 
 type CustomSchedulerArgs struct {
@@ -15,7 +19,7 @@ type CustomSchedulerArgs struct {
 }
 
 type CustomScheduler struct {
-	handle 	framework.Handle
+	handle    framework.Handle
 	scoreMode string
 }
 
@@ -24,11 +28,11 @@ var _ framework.ScorePlugin = &CustomScheduler{}
 
 // Name is the name of the plugin used in Registry and configurations.
 const (
-	Name				string = "CustomScheduler"
-	groupNameLabel 		string = "podGroup"
-	minAvailableLabel 	string = "minAvailable"
-	leastMode			string = "Least"
-	mostMode			string = "Most"			
+	Name              string = "CustomScheduler"
+	groupNameLabel    string = "podGroup"
+	minAvailableLabel string = "minAvailable"
+	leastMode         string = "Least"
+	mostMode          string = "Most"
 )
 
 func (cs *CustomScheduler) Name() string {
@@ -60,12 +64,32 @@ func New(obj runtime.Object, h framework.Handle) (framework.Plugin, error) {
 // filter the pod if the pod in group is less than minAvailable
 func (cs *CustomScheduler) PreFilter(ctx context.Context, state *framework.CycleState, pod *v1.Pod) (*framework.PreFilterResult, *framework.Status) {
 	log.Printf("Pod %s is in Prefilter phase.", pod.Name)
-	newStatus := framework.NewStatus(framework.Success, "")
 
 	// TODO
 	// 1. extract the label of the pod
 	// 2. retrieve the pod with the same group label
 	// 3. justify if the pod can be scheduled
+	pod_label := pod.ObjectMeta.GetLabels()
+	// create set
+	podGroup := make(map[string]string)
+	podGroup[groupNameLabel] = pod_label[groupNameLabel]
+
+	selector := labels.SelectorFromSet(podGroup)
+	pods, err := cs.handle.SharedInformerFactory().Core().V1().Pods().Lister().List(selector)
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, "error select label")
+	}
+
+	var newStatus *framework.Status
+	minAvailable, err := strconv.Atoi(pod_label[minAvailableLabel])
+	if err != nil {
+		return nil, framework.NewStatus(framework.Error, "error atoi")
+	}
+	if len(pods) < minAvailable {
+		newStatus = framework.NewStatus(framework.Unschedulable, "unschedulable")
+	} else {
+		newStatus = framework.NewStatus(framework.Success, "success PreFilter")
+	}
 
 	return nil, newStatus
 }
@@ -75,7 +99,6 @@ func (cs *CustomScheduler) PreFilterExtensions() framework.PreFilterExtensions {
 	return nil
 }
 
-
 // Score invoked at the score extension point.
 func (cs *CustomScheduler) Score(ctx context.Context, state *framework.CycleState, pod *v1.Pod, nodeName string) (int64, *framework.Status) {
 	log.Printf("Pod %s is in Score phase. Calculate the score of Node %s.", pod.Name, nodeName)
@@ -83,16 +106,41 @@ func (cs *CustomScheduler) Score(ctx context.Context, state *framework.CycleStat
 	// TODO
 	// 1. retrieve the node allocatable memory
 	// 2. return the score based on the scheduler mode
-	
-	return 0, nil
+	nodeInfo, err := cs.handle.SnapshotSharedLister().NodeInfos().Get(nodeName)
+	if err != nil {
+		return 0, framework.NewStatus(framework.Error, "error nodeInfo")
+	}
+
+	var score int64
+	if cs.scoreMode == mostMode {
+		score = nodeInfo.Allocatable.Memory - nodeInfo.Requested.Memory
+	} else if cs.scoreMode == leastMode {
+		score = -1 * (nodeInfo.Allocatable.Memory - nodeInfo.Requested.Memory)
+	}
+	log.Printf("Node %s remain memory %d", nodeName, nodeInfo.Allocatable.Memory-nodeInfo.Requested.Memory)
+	return score, framework.NewStatus(framework.Success, "success Score")
 }
 
 // ensure the scores are within the valid range
 func (cs *CustomScheduler) NormalizeScore(ctx context.Context, state *framework.CycleState, pod *v1.Pod, scores framework.NodeScoreList) *framework.Status {
 	// TODO
-	// find the range of the current score and map to the valid range
+	// 1. find the range of the current score
+	// 2. map to the valid range
+	max_num := int64(math.MinInt64)
+	min_num := int64(math.MaxInt64)
+	for _, node := range scores {
+		if node.Score > max_num {
+			max_num = node.Score
+		}
+		if node.Score < min_num {
+			min_num = node.Score
+		}
+	}
+	for i, node := range scores {
+		scores[i].Score = (node.Score - min_num) * 100 / (max_num - min_num)
+	}
 
-	return nil
+	return framework.NewStatus(framework.Success, "success NormalizeScore")
 }
 
 // ScoreExtensions of the Score plugin.
